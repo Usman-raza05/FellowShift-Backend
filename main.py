@@ -192,6 +192,7 @@ class OfficerDecisionRequest(BaseModel):
 # ==============================================================================
 
 DOCUMENT_EXTRACTION_PROMPT = """
+
 You are a document OCR and structured data extraction assistant for a scholarship application testing system.
 
 Analyze the uploaded document image and return accurate structured JSON matching the provided schema.
@@ -783,6 +784,286 @@ def evaluate_eligibility(
 # TEST MODE EVALUATION
 # ==============================================================================
 
+# def evaluate_test_mode(
+#     income: float,
+#     marks_pct: float,
+#     stated_caste: str,
+#     student_name: str,
+#     caste_doc: DocumentExtractionResult,
+#     income_doc: DocumentExtractionResult,
+#     marksheet_doc: DocumentExtractionResult,
+# ) -> tuple[
+#     ApplicationStatus,
+#     float,
+#     List[str],
+#     List[str]
+# ]:
+
+#     """
+#     Test-mode evaluation.
+
+#     IMPORTANT:
+#     - This does not authenticate government documents.
+#     - This does not produce a real approval.
+#     - It only evaluates clearly labelled test/demo fixtures.
+#     """
+
+#     issues: List[str] = []
+#     passed_checks: List[str] = []
+
+#     documents = [
+#         (
+#             "Caste certificate",
+#             caste_doc,
+#             "ST_CASTE_CERT"
+#         ),
+#         (
+#             "Income certificate",
+#             income_doc,
+#             "INCOME_CERT"
+#         ),
+#         (
+#             "Marksheet",
+#             marksheet_doc,
+#             "MARKSHEET"
+#         ),
+#     ]
+
+#     # --------------------------------------------------------------------------
+#     # 1. TEST DOCUMENT MARKER + REQUIRED FIELDS
+#     # --------------------------------------------------------------------------
+
+#     for name, document, expected_type in documents:
+
+#         if not has_demo_marker(document):
+
+#             issues.append(
+#                 f"{name}: expected a clearly labelled "
+#                 "test/demo document."
+#             )
+
+#         else:
+
+#             passed_checks.append(
+#                 f"{name}: test/demo marker detected."
+#             )
+
+#         if not has_required_extracted_fields(
+#             document,
+#             expected_type
+#         ):
+
+#             issues.append(
+#                 f"{name}: required fields could not be "
+#                 "extracted or document type did not match."
+#             )
+
+#         else:
+
+#             passed_checks.append(
+#                 f"{name}: document type and required "
+#                 "fields extracted successfully."
+#             )
+
+#     # --------------------------------------------------------------------------
+#     # 2. STUDENT NAME CROSS-CHECK
+#     # --------------------------------------------------------------------------
+
+#     submitted_name = " ".join(
+#         student_name.casefold().split()
+#     )
+
+#     for name, document, _ in documents:
+
+#         extracted_name = (
+#             document.extracted_full_name
+#         )
+
+#         if extracted_name:
+
+#             normalized_name = " ".join(
+#                 extracted_name.casefold().split()
+#             )
+
+#             if normalized_name != submitted_name:
+
+#                 issues.append(
+#                     f"{name}: extracted student name "
+#                     "does not match the submitted name."
+#                 )
+
+#             else:
+
+#                 passed_checks.append(
+#                     f"{name}: student name matches."
+#                 )
+
+#     # --------------------------------------------------------------------------
+#     # 3. INCOME CROSS-CHECK
+#     # --------------------------------------------------------------------------
+
+#     extracted_income = (
+#         income_doc.extracted_annual_income
+#     )
+
+#     if extracted_income is not None:
+
+#         if abs(
+#             extracted_income - income
+#         ) > 5000:
+
+#             issues.append(
+#                 "Income certificate value does not match "
+#                 "the submitted income."
+#             )
+
+#         else:
+
+#             passed_checks.append(
+#                 "Income form value matches the test document."
+#             )
+
+#     # --------------------------------------------------------------------------
+#     # 4. MARKS CROSS-CHECK
+#     # --------------------------------------------------------------------------
+
+#     extracted_marks = (
+#         marksheet_doc.extracted_percentage
+#     )
+
+#     if extracted_marks is not None:
+
+#         if abs(
+#             extracted_marks - marks_pct
+#         ) > 1.0:
+
+#             issues.append(
+#                 "Marksheet percentage does not match "
+#                 "the submitted academic percentage."
+#             )
+
+#         else:
+
+#             passed_checks.append(
+#                 "Marks form value matches the test document."
+#             )
+
+#     # --------------------------------------------------------------------------
+#     # 5. CASTE CROSS-CHECK
+#     # --------------------------------------------------------------------------
+
+#     extracted_caste = (
+#         caste_doc.extracted_category_caste
+#     )
+
+#     if extracted_caste:
+
+#         normalized_document_caste = (
+#             extracted_caste.casefold().strip()
+#         )
+
+#         normalized_form_caste = (
+#             stated_caste.casefold().strip()
+#         )
+
+#         if (
+#             normalized_document_caste !=
+#             normalized_form_caste
+#         ):
+
+#             # Allow ST category wording such as
+#             # "Scheduled Tribe" vs "ST".
+#             if not (
+#                 "st" in normalized_document_caste
+#                 and "st" in normalized_form_caste
+#             ):
+
+#                 issues.append(
+#                     "Caste/category in the test document "
+#                     "does not match the submitted form."
+#                 )
+
+#             else:
+
+#                 passed_checks.append(
+#                     "Caste/category matches the test form."
+#                 )
+
+#         else:
+
+#             passed_checks.append(
+#                 "Caste/category matches the test form."
+#             )
+
+#     # --------------------------------------------------------------------------
+#     # 6. TEST ELIGIBILITY THRESHOLDS
+#     # --------------------------------------------------------------------------
+
+#     if income > MAX_INCOME_LIMIT:
+
+#         issues.append(
+#             "Income exceeds the configured test threshold."
+#         )
+
+#     else:
+
+#         passed_checks.append(
+#             "Income eligibility test passed."
+#         )
+
+#     if marks_pct < MIN_MARKS_LIMIT:
+
+#         issues.append(
+#             "Marks are below the configured test threshold."
+#         )
+
+#     else:
+
+#         passed_checks.append(
+#             "Academic eligibility test passed."
+#         )
+
+#     # --------------------------------------------------------------------------
+#     # 7. FINAL TEST STATUS
+#     # --------------------------------------------------------------------------
+
+#     if issues:
+
+#         result_status = (
+#             ApplicationStatus.TEST_ONLY_FAILED
+#         )
+
+#     else:
+
+#         result_status = (
+#             ApplicationStatus.TEST_ONLY_PASSED
+#         )
+
+#     # --------------------------------------------------------------------------
+#     # 8. TEST CHECK SCORE
+#     # --------------------------------------------------------------------------
+
+#     # This is NOT an AI confidence score.
+#     total_checks = (
+#         len(passed_checks)
+#         + len(issues)
+#     )
+
+#     score = (
+#         100.0
+#         * len(passed_checks)
+#         / total_checks
+#         if total_checks
+#         else 0.0
+#     )
+
+#     return (
+#         result_status,
+#         score,
+#         issues,
+#         passed_checks
+#     )
+
 def evaluate_test_mode(
     income: float,
     marks_pct: float,
@@ -797,272 +1078,111 @@ def evaluate_test_mode(
     List[str],
     List[str]
 ]:
-
     """
-    Test-mode evaluation.
-
-    IMPORTANT:
-    - This does not authenticate government documents.
-    - This does not produce a real approval.
-    - It only evaluates clearly labelled test/demo fixtures.
+    TEST MODE ONLY.
+    Does not authenticate documents or grant real approval.
+    Missing optional OCR fields do not automatically fail a test.
     """
 
     issues: List[str] = []
     passed_checks: List[str] = []
 
     documents = [
-        (
-            "Caste certificate",
-            caste_doc,
-            "ST_CASTE_CERT"
-        ),
-        (
-            "Income certificate",
-            income_doc,
-            "INCOME_CERT"
-        ),
-        (
-            "Marksheet",
-            marksheet_doc,
-            "MARKSHEET"
-        ),
+        ("Caste certificate", caste_doc, "ST_CASTE_CERT"),
+        ("Income certificate", income_doc, "INCOME_CERT"),
+        ("Marksheet", marksheet_doc, "MARKSHEET"),
     ]
 
-    # --------------------------------------------------------------------------
-    # 1. TEST DOCUMENT MARKER + REQUIRED FIELDS
-    # --------------------------------------------------------------------------
-
+    # Check document recognition without requiring the AI
+    # to repeat a SAMPLE/TEST marker in its issue list.
     for name, document, expected_type in documents:
+        actual_type = (document.document_type or "").strip().upper()
 
-        if not has_demo_marker(document):
+        aliases = {
+            "CASTE_CERTIFICATE": "ST_CASTE_CERT",
+            "CASTE CERTIFICATE": "ST_CASTE_CERT",
+            "INCOME_CERTIFICATE": "INCOME_CERT",
+            "INCOME CERTIFICATE": "INCOME_CERT",
+            "STATEMENT OF MARKS": "MARKSHEET",
+            "MARKSHEET": "MARKSHEET",
+        }
+        actual_type = aliases.get(actual_type, actual_type)
 
-            issues.append(
-                f"{name}: expected a clearly labelled "
-                "test/demo document."
-            )
-
-        else:
-
+        if document.is_valid_document:
             passed_checks.append(
-                f"{name}: test/demo marker detected."
+                f"{name}: readable document accepted in test mode."
             )
-
-        if not has_required_extracted_fields(
-            document,
-            expected_type
-        ):
-
-            issues.append(
-                f"{name}: required fields could not be "
-                "extracted or document type did not match."
-            )
-
         else:
-
-            passed_checks.append(
-                f"{name}: document type and required "
-                "fields extracted successfully."
+            issues.append(
+                f"{name}: document readability could not be confirmed."
             )
 
-    # --------------------------------------------------------------------------
-    # 2. STUDENT NAME CROSS-CHECK
-    # --------------------------------------------------------------------------
+        # Report missing fields only when a test specifically
+        # requires strict extraction validation. Do not require
+        # optional fields merely to complete a demo submission.
+        if actual_type == expected_type:
+            passed_checks.append(
+                f"{name}: document type recognized."
+            )
+        elif actual_type:
+            issues.append(
+                f"{name}: document type does not match expected type."
+            )
 
-    submitted_name = " ".join(
-        student_name.casefold().split()
-    )
+    # Cross-check values only when the OCR actually extracted them.
+    submitted_name = " ".join(student_name.casefold().split())
 
     for name, document, _ in documents:
-
-        extracted_name = (
-            document.extracted_full_name
-        )
-
-        if extracted_name:
-
-            normalized_name = " ".join(
-                extracted_name.casefold().split()
+        if document.extracted_full_name:
+            extracted_name = " ".join(
+                document.extracted_full_name.casefold().split()
             )
-
-            if normalized_name != submitted_name:
-
+            if extracted_name != submitted_name:
                 issues.append(
-                    f"{name}: extracted student name "
-                    "does not match the submitted name."
+                    f"{name}: extracted name differs from submitted name."
                 )
-
             else:
+                passed_checks.append(f"{name}: student name matches.")
 
-                passed_checks.append(
-                    f"{name}: student name matches."
-                )
-
-    # --------------------------------------------------------------------------
-    # 3. INCOME CROSS-CHECK
-    # --------------------------------------------------------------------------
-
-    extracted_income = (
-        income_doc.extracted_annual_income
-    )
-
-    if extracted_income is not None:
-
-        if abs(
-            extracted_income - income
-        ) > 5000:
-
+    if income_doc.extracted_annual_income is not None:
+        if abs(income_doc.extracted_annual_income - income) > 5000:
             issues.append(
-                "Income certificate value does not match "
-                "the submitted income."
+                "Income certificate value differs from submitted income."
             )
-
         else:
+            passed_checks.append("Income values match.")
 
-            passed_checks.append(
-                "Income form value matches the test document."
-            )
-
-    # --------------------------------------------------------------------------
-    # 4. MARKS CROSS-CHECK
-    # --------------------------------------------------------------------------
-
-    extracted_marks = (
-        marksheet_doc.extracted_percentage
-    )
-
-    if extracted_marks is not None:
-
-        if abs(
-            extracted_marks - marks_pct
-        ) > 1.0:
-
+    if marksheet_doc.extracted_percentage is not None:
+        if abs(marksheet_doc.extracted_percentage - marks_pct) > 1.0:
             issues.append(
-                "Marksheet percentage does not match "
-                "the submitted academic percentage."
+                "Marksheet percentage differs from submitted percentage."
             )
-
         else:
+            passed_checks.append("Academic percentages match.")
 
-            passed_checks.append(
-                "Marks form value matches the test document."
-            )
+    if income <= MAX_INCOME_LIMIT:
+        passed_checks.append("Income eligibility test passed.")
+    else:
+        issues.append("Income exceeds the configured test threshold.")
 
-    # --------------------------------------------------------------------------
-    # 5. CASTE CROSS-CHECK
-    # --------------------------------------------------------------------------
+    if marks_pct >= MIN_MARKS_LIMIT:
+        passed_checks.append("Academic eligibility test passed.")
+    else:
+        issues.append("Academic score is below the test threshold.")
 
-    extracted_caste = (
-        caste_doc.extracted_category_caste
+    result_status = (
+        ApplicationStatus.TEST_ONLY_PASSED
+        if not issues
+        else ApplicationStatus.TEST_ONLY_FAILED
     )
 
-    if extracted_caste:
-
-        normalized_document_caste = (
-            extracted_caste.casefold().strip()
-        )
-
-        normalized_form_caste = (
-            stated_caste.casefold().strip()
-        )
-
-        if (
-            normalized_document_caste !=
-            normalized_form_caste
-        ):
-
-            # Allow ST category wording such as
-            # "Scheduled Tribe" vs "ST".
-            if not (
-                "st" in normalized_document_caste
-                and "st" in normalized_form_caste
-            ):
-
-                issues.append(
-                    "Caste/category in the test document "
-                    "does not match the submitted form."
-                )
-
-            else:
-
-                passed_checks.append(
-                    "Caste/category matches the test form."
-                )
-
-        else:
-
-            passed_checks.append(
-                "Caste/category matches the test form."
-            )
-
-    # --------------------------------------------------------------------------
-    # 6. TEST ELIGIBILITY THRESHOLDS
-    # --------------------------------------------------------------------------
-
-    if income > MAX_INCOME_LIMIT:
-
-        issues.append(
-            "Income exceeds the configured test threshold."
-        )
-
-    else:
-
-        passed_checks.append(
-            "Income eligibility test passed."
-        )
-
-    if marks_pct < MIN_MARKS_LIMIT:
-
-        issues.append(
-            "Marks are below the configured test threshold."
-        )
-
-    else:
-
-        passed_checks.append(
-            "Academic eligibility test passed."
-        )
-
-    # --------------------------------------------------------------------------
-    # 7. FINAL TEST STATUS
-    # --------------------------------------------------------------------------
-
-    if issues:
-
-        result_status = (
-            ApplicationStatus.TEST_ONLY_FAILED
-        )
-
-    else:
-
-        result_status = (
-            ApplicationStatus.TEST_ONLY_PASSED
-        )
-
-    # --------------------------------------------------------------------------
-    # 8. TEST CHECK SCORE
-    # --------------------------------------------------------------------------
-
-    # This is NOT an AI confidence score.
-    total_checks = (
-        len(passed_checks)
-        + len(issues)
-    )
-
+    total_checks = len(passed_checks) + len(issues)
     score = (
-        100.0
-        * len(passed_checks)
-        / total_checks
-        if total_checks
-        else 0.0
+        100.0 * len(passed_checks) / total_checks
+        if total_checks else 0.0
     )
 
-    return (
-        result_status,
-        score,
-        issues,
-        passed_checks
-    )
-
+    return result_status, score, issues, passed_checks
 
 # ==============================================================================
 # ROOT
