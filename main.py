@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import sqlite3
+import time
 from typing import Optional
 from uuid import uuid4
 import logging
@@ -18,6 +19,7 @@ from fastapi import (
     status,
 )
 from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
@@ -33,6 +35,12 @@ from verification_api.schemas import (
 )
 from verification_api.service import compare_document_data, evaluate_criteria
 from verification_api.idempotency import claim_idempotency_key
+from verification_api.diagnostics import (
+    log_event,
+    log_exception,
+    new_correlation_id,
+    request_correlation_id,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("FellowShift")
@@ -49,12 +57,77 @@ app = FastAPI(
     version="2.0.0"
 )
 
+VERIFICATION_PATHS = {"/api/v1/verifications", "/api/scholarship/apply"}
+
+
+@app.middleware("http")
+async def log_verification_request(request: Request, call_next):
+    if request.url.path not in VERIFICATION_PATHS:
+        return await call_next(request)
+
+    correlation_id = new_correlation_id()
+    context_token = request_correlation_id.set(correlation_id)
+    started_at = time.perf_counter()
+    log_event(
+        logger,
+        logging.INFO,
+        "[VERIFICATION]",
+        "Request received",
+        method=request.method,
+    )
+    log_event(
+        logger,
+        logging.INFO,
+        "[VERIFICATION]",
+        "Request validation started",
+    )
+    try:
+        response = await call_next(request)
+    except Exception as error:
+        log_exception(
+            logger,
+            "[VERIFICATION]",
+            "Unexpected request failure",
+            error,
+            error_category="UNHANDLED_REQUEST_EXCEPTION",
+        )
+        log_event(
+            logger,
+            logging.ERROR,
+            "[VERIFICATION]",
+            "Request completed",
+            http_status=500,
+            duration_ms=round((time.perf_counter() - started_at) * 1000),
+        )
+        raise
+    else:
+        log_event(
+            logger,
+            logging.INFO,
+            "[VERIFICATION]",
+            "Request completed",
+            http_status=response.status_code,
+            duration_ms=round((time.perf_counter() - started_at) * 1000),
+        )
+        return response
+    finally:
+        request_correlation_id.reset(context_token)
+
 
 @app.exception_handler(RequestValidationError)
 async def handle_request_validation_error(
     request: Request,
     exc: RequestValidationError,
 ) -> JSONResponse:
+    if request.url.path in VERIFICATION_PATHS:
+        log_event(
+            logger,
+            logging.WARNING,
+            "[VERIFICATION]",
+            "Request validation failed",
+            error_category="INVALID_REQUEST",
+            http_status=422,
+        )
     return JSONResponse(
         status_code=422,
         content={
@@ -64,6 +137,31 @@ async def handle_request_validation_error(
             }
         },
     )
+
+
+@app.exception_handler(HTTPException)
+async def handle_http_exception(
+    request: Request,
+    exc: HTTPException,
+) -> JSONResponse:
+    if request.url.path in VERIFICATION_PATHS and exc.status_code == 422:
+        detail = exc.detail
+        error_category = (
+            detail.get("error", "INVALID_REQUEST")
+            if isinstance(detail, dict)
+            else "INVALID_REQUEST"
+        )
+        if not isinstance(error_category, str) or not error_category.isupper():
+            error_category = "INVALID_REQUEST"
+        log_event(
+            logger,
+            logging.WARNING,
+            "[VERIFICATION]",
+            "Request validation failed",
+            error_category=error_category,
+            http_status=422,
+        )
+    return await http_exception_handler(request, exc)
 
 # Scholarship criteria evaluation lives in verification_api.service.
 
@@ -186,12 +284,27 @@ async def submit_application(
         read_and_validate_document(marksheet),
     )
 
+    log_event(
+        logger,
+        logging.INFO,
+        "[IDEMPOTENCY]",
+        "Idempotency check started",
+    )
     try:
         claimed = await asyncio.to_thread(
             claim_idempotency_key,
             idempotency_key,
         )
-    except (OSError, sqlite3.Error):
+    except (OSError, sqlite3.Error) as error:
+        log_event(
+            logger,
+            logging.ERROR,
+            "[IDEMPOTENCY]",
+            "Idempotency check failed",
+            error_type=type(error).__name__,
+            error_category="IDEMPOTENCY_UNAVAILABLE",
+            http_status=503,
+        )
         raise HTTPException(
             status_code=503,
             detail={
@@ -200,6 +313,14 @@ async def submit_application(
             },
         ) from None
     if not claimed:
+        log_event(
+            logger,
+            logging.WARNING,
+            "[IDEMPOTENCY]",
+            "Idempotency check failed",
+            error_category="DUPLICATE_REQUEST",
+            http_status=409,
+        )
         raise HTTPException(
             status_code=409,
             detail={
@@ -207,6 +328,12 @@ async def submit_application(
                 "message": "This idempotency key was already used.",
             },
         )
+    log_event(
+        logger,
+        logging.INFO,
+        "[IDEMPOTENCY]",
+        "Idempotency check succeeded",
+    )
 
     # --------------------------------------------------------------------------
     # OPTIMIZE ALL IMAGES IN PARALLEL
@@ -247,7 +374,14 @@ async def submit_application(
     except HTTPException:
         raise
 
-    except Exception:
+    except Exception as error:
+        log_exception(
+            logger,
+            "[IMAGE]",
+            "Image optimization failed",
+            error,
+            error_category="IMAGE_PROCESSING_FAILED",
+        )
 
         raise HTTPException(
             status_code=400,
@@ -272,6 +406,15 @@ async def submit_application(
             timeout=get_ai_request_timeout_seconds(),
         )
     except asyncio.TimeoutError:
+        log_event(
+            logger,
+            logging.ERROR,
+            "[VERIFICATION]",
+            "Request failed",
+            error_type="TimeoutError",
+            error_category="AI_PROVIDER_TIMEOUT",
+            http_status=503,
+        )
         return JSONResponse(
             status_code=503,
             content={
@@ -285,7 +428,15 @@ async def submit_application(
                 ],
             },
         )
-    except RuntimeError:
+    except RuntimeError as error:
+        log_exception(
+            logger,
+            "[VERIFICATION]",
+            "Document verification failed",
+            error,
+            error_category="AI_PROVIDER_FAILURE",
+            http_status=503,
+        )
         return JSONResponse(
             status_code=503,
             content={

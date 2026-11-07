@@ -1,8 +1,10 @@
 import asyncio
 import json
+import logging
 import math
 import re
 import sqlite3
+import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile, status
@@ -26,12 +28,14 @@ from verification_api.schemas import (
 )
 from verification_api.security import require_service_auth
 from verification_api.service import compare_document_data, evaluate_criteria
+from verification_api.diagnostics import log_event, log_exception
 
 
 router = APIRouter(
     prefix="/api/v1",
     dependencies=[Depends(require_service_auth)],
 )
+logger = logging.getLogger(__name__)
 
 
 class VerificationSubmission(BaseModel):
@@ -156,6 +160,15 @@ def _response(
     documents: list[DocumentVerification] | None = None,
     http_status: int = status.HTTP_200_OK,
 ) -> JSONResponse:
+    log_event(
+        logger,
+        logging.INFO if http_status < 500 else logging.ERROR,
+        "[VERIFICATION]",
+        "Final status",
+        result=outcome.value,
+        http_status=http_status,
+        reason_codes=",".join(reason.code for reason in reasons) or "NONE",
+    )
     response = VerificationResponse(
         application_id=application_id,
         outcome=outcome,
@@ -166,6 +179,39 @@ def _response(
         status_code=http_status,
         content=response.model_dump(mode="json"),
     )
+
+
+def _evaluate_criteria_with_logging(
+    application_data: dict[str, Any],
+    criteria: list[EligibilityCriterion],
+) -> tuple[VerificationOutcome, list[VerificationReason]]:
+    log_event(
+        logger,
+        logging.INFO,
+        "[ELIGIBILITY]",
+        "Evaluation started",
+        criteria_count=len(criteria),
+    )
+    try:
+        outcome, reasons = evaluate_criteria(application_data, criteria)
+    except Exception as error:
+        log_exception(
+            logger,
+            "[ELIGIBILITY]",
+            "Evaluation failed",
+            error,
+            error_category="ELIGIBILITY_EVALUATION_FAILED",
+        )
+        raise
+    log_event(
+        logger,
+        logging.INFO,
+        "[ELIGIBILITY]",
+        "Evaluation completed",
+        result=outcome.value,
+        reason_codes=",".join(reason.code for reason in reasons) or "NONE",
+    )
+    return outcome, reasons
 
 
 @router.post(
@@ -194,6 +240,12 @@ async def verify_application(
         max_length=200,
     ),
 ) -> JSONResponse:
+    log_event(
+        logger,
+        logging.INFO,
+        "[VERIFICATION]",
+        "Request validation started",
+    )
     if len(criteria) > 65536 or len(required_document_types) > 8192 or len(document_types) > 8192:
         raise HTTPException(
             status_code=413,
@@ -245,6 +297,14 @@ async def verify_application(
                 "message": "document_types must contain one type for each uploaded document, in upload order.",
             },
         )
+    log_event(
+        logger,
+        logging.INFO,
+        "[VERIFICATION]",
+        "Request validation succeeded",
+        required_document_type_count=len(required_document_type_values),
+        uploaded_document_count=len(documents),
+    )
     normalized_required_types = [
         _normalize_document_type(document_type)
         for document_type in required_document_type_values
@@ -256,19 +316,84 @@ async def verify_application(
         )
 
     checked_documents: list[tuple[str, bytes, str]] = []
-    for document_type, upload in zip(uploaded_document_type_values, documents):
-        content, mime_type = await read_and_validate_document(upload)
-        checked_documents.append((document_type, content, mime_type))
+    log_event(
+        logger,
+        logging.INFO,
+        "[DOCUMENTS]",
+        "Document validation started",
+        required_count=len(required_document_type_values),
+        uploaded_count=len(documents),
+    )
+    try:
+        for document_type, upload in zip(uploaded_document_type_values, documents):
+            content, mime_type = await read_and_validate_document(upload)
+            checked_documents.append((document_type, content, mime_type))
+    except HTTPException as error:
+        detail = error.detail
+        error_category = (
+            detail.get("error", "DOCUMENT_VALIDATION_FAILED")
+            if isinstance(detail, dict)
+            else "DOCUMENT_VALIDATION_FAILED"
+        )
+        log_event(
+            logger,
+            logging.WARNING,
+            "[DOCUMENTS]",
+            "Document validation failed",
+            error_category=error_category,
+            http_status=error.status_code,
+        )
+        raise
+    except Exception as error:
+        log_exception(
+            logger,
+            "[DOCUMENTS]",
+            "Document validation failed",
+            error,
+            error_category="UNEXPECTED_DOCUMENT_VALIDATION_FAILURE",
+        )
+        raise
+    log_event(
+        logger,
+        logging.INFO,
+        "[DOCUMENTS]",
+        "Document validation completed",
+        selected_count=len(documents),
+        valid_count=len(checked_documents),
+    )
 
+    log_event(
+        logger,
+        logging.INFO,
+        "[IDEMPOTENCY]",
+        "Idempotency check started",
+    )
     try:
         claimed = await asyncio.to_thread(claim_idempotency_key, idempotency_key)
-    except (OSError, sqlite3.Error):
+    except (OSError, sqlite3.Error) as error:
+        log_event(
+            logger,
+            logging.ERROR,
+            "[IDEMPOTENCY]",
+            "Idempotency check failed",
+            error_type=type(error).__name__,
+            error_category="IDEMPOTENCY_UNAVAILABLE",
+            http_status=503,
+        )
         raise HTTPException(
             status_code=503,
             detail={"error": "IDEMPOTENCY_UNAVAILABLE", "message": "Request deduplication is temporarily unavailable."},
         ) from None
 
     if not claimed:
+        log_event(
+            logger,
+            logging.WARNING,
+            "[IDEMPOTENCY]",
+            "Idempotency check failed",
+            error_category="DUPLICATE_REQUEST",
+            http_status=409,
+        )
         raise HTTPException(
             status_code=409,
             detail={
@@ -277,6 +402,18 @@ async def verify_application(
             },
         )
 
+    log_event(
+        logger,
+        logging.INFO,
+        "[IDEMPOTENCY]",
+        "Idempotency check succeeded",
+    )
+    log_event(
+        logger,
+        logging.INFO,
+        "[VERIFICATION]",
+        "Processing started",
+    )
     uploaded_type_keys = {
         _normalize_document_type(document_type)
         for document_type in uploaded_document_type_values
@@ -298,7 +435,7 @@ async def verify_application(
             ],
         )
 
-    outcome, reasons = evaluate_criteria(
+    outcome, reasons = _evaluate_criteria_with_logging(
         submission.application_data,
         parsed_criteria,
     )
@@ -310,6 +447,14 @@ async def verify_application(
     processor = getattr(request.app.state, "document_processor", None)
     optimizer = getattr(request.app.state, "image_optimizer", None)
     if processor is None or optimizer is None:
+        log_event(
+            logger,
+            logging.ERROR,
+            "[DOCUMENTS]",
+            "Document processing unavailable",
+            error_category="PROCESSOR_NOT_CONFIGURED",
+            http_status=503,
+        )
         return _response(
             submission.application_id,
             VerificationOutcome.FAILED,
@@ -325,6 +470,15 @@ async def verify_application(
     try:
         timeout_seconds = get_ai_request_timeout_seconds()
     except RuntimeError as error:
+        log_event(
+            logger,
+            logging.ERROR,
+            "[VERIFICATION]",
+            "Request failed",
+            error_type=type(error).__name__,
+            error_category="INVALID_TIMEOUT_CONFIGURATION",
+            http_status=503,
+        )
         return _response(
             submission.application_id,
             VerificationOutcome.FAILED,
@@ -338,22 +492,93 @@ async def verify_application(
         )
 
     async def process_one(
+        document_index: int,
         document_type: str,
         content: bytes,
         mime_type: str,
     ) -> DocumentVerification:
-        optimized, optimized_mime = await asyncio.to_thread(
-            optimizer,
-            content,
-            mime_type,
+        optimization_started = time.perf_counter()
+        log_event(
+            logger,
+            logging.INFO,
+            "[IMAGE]",
+            "Image optimization started",
+            document_index=document_index,
         )
-        result, provider = await processor(
-            optimized,
-            optimized_mime,
-            document_type,
+        try:
+            optimized, optimized_mime = await asyncio.to_thread(
+                optimizer,
+                content,
+                mime_type,
+            )
+        except Exception as error:
+            log_exception(
+                logger,
+                "[IMAGE]",
+                "Image optimization failed",
+                error,
+                document_index=document_index,
+                error_category="IMAGE_OPTIMIZATION_FAILED",
+            )
+            raise
+        log_event(
+            logger,
+            logging.INFO,
+            "[IMAGE]",
+            "Image optimization completed",
+            document_index=document_index,
+            duration_ms=round((time.perf_counter() - optimization_started) * 1000),
         )
-        extraction = DocumentExtractionResult.model_validate(
-            result.model_dump() if hasattr(result, "model_dump") else result
+        processing_started = time.perf_counter()
+        log_event(
+            logger,
+            logging.INFO,
+            "[DOCUMENTS]",
+            "Document processing started",
+            document_index=document_index,
+        )
+        log_event(
+            logger,
+            logging.INFO,
+            "[OCR]",
+            "OCR started",
+            document_index=document_index,
+        )
+        try:
+            result, provider = await processor(
+                optimized,
+                optimized_mime,
+                document_type,
+            )
+            extraction = DocumentExtractionResult.model_validate(
+                result.model_dump() if hasattr(result, "model_dump") else result
+            )
+        except Exception as error:
+            log_exception(
+                logger,
+                "[OCR]",
+                "OCR failed",
+                error,
+                document_index=document_index,
+                error_category="DOCUMENT_PROCESSING_FAILED",
+            )
+            raise
+        duration_ms = round((time.perf_counter() - processing_started) * 1000)
+        log_event(
+            logger,
+            logging.INFO,
+            "[OCR]",
+            "OCR completed",
+            document_index=document_index,
+            duration_ms=duration_ms,
+        )
+        log_event(
+            logger,
+            logging.INFO,
+            "[DOCUMENTS]",
+            "Document processing completed",
+            document_index=document_index,
+            duration_ms=duration_ms,
         )
         return DocumentVerification(
             document_type=document_type,
@@ -361,17 +586,38 @@ async def verify_application(
             extraction=extraction,
         )
 
+    log_event(
+        logger,
+        logging.INFO,
+        "[DOCUMENTS]",
+        "Documents selected for AI processing",
+        selected_count=len(checked_documents),
+    )
+    processing_started = time.perf_counter()
     try:
         processed_documents = await asyncio.wait_for(
             asyncio.gather(
                 *(
-                    process_one(document_type, content, mime_type)
-                    for document_type, content, mime_type in checked_documents
+                    process_one(index, document_type, content, mime_type)
+                    for index, (document_type, content, mime_type) in enumerate(
+                        checked_documents,
+                        start=1,
+                    )
                 )
             ),
             timeout=timeout_seconds,
         )
     except asyncio.TimeoutError:
+        log_event(
+            logger,
+            logging.ERROR,
+            "[VERIFICATION]",
+            "Request failed",
+            error_type="TimeoutError",
+            error_category="AI_PROVIDER_TIMEOUT",
+            http_status=503,
+            duration_ms=round((time.perf_counter() - processing_started) * 1000),
+        )
         return _response(
             submission.application_id,
             VerificationOutcome.FAILED,
@@ -383,7 +629,16 @@ async def verify_application(
             ],
             http_status=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
-    except Exception:
+    except Exception as error:
+        log_exception(
+            logger,
+            "[VERIFICATION]",
+            "Document verification failed",
+            error,
+            error_category="AI_PROVIDER_FAILURE",
+            http_status=503,
+            duration_ms=round((time.perf_counter() - processing_started) * 1000),
+        )
         return _response(
             submission.application_id,
             VerificationOutcome.FAILED,

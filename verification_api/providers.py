@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import os
+import time
 from io import BytesIO
 
 from dotenv import load_dotenv
@@ -16,6 +17,7 @@ from mistralai.client import Mistral
 from mistralai.client.utils.retries import BackoffStrategy, RetryConfig
 
 from verification_api.config import get_model_name, get_provider_timeout_ms
+from verification_api.diagnostics import log_event, log_exception
 from verification_api.schemas import DocumentExtractionResult
 
 
@@ -83,23 +85,54 @@ class _GeminiExtractionSchema(BaseModel):
 def _get_mistral_client() -> Mistral:
     global _mistral_client
     if _mistral_client is None:
+        log_event(
+            logger,
+            logging.INFO,
+            "[MISTRAL]",
+            "Provider initialization started",
+        )
         api_key = os.getenv("MISTRAL_API_KEY")
         if not api_key:
+            log_event(
+                logger,
+                logging.ERROR,
+                "[MISTRAL]",
+                "Provider initialization failed",
+                error_type="RuntimeError",
+                error_category="MISTRAL_NOT_CONFIGURED",
+            )
             raise RuntimeError("Mistral is not configured.")
-        _mistral_client = Mistral(
-            api_key=api_key,
-            timeout_ms=get_provider_timeout_ms(),
-            retry_config=RetryConfig(
-                strategy="none",
-                backoff=BackoffStrategy(
-                    initial_interval=0,
-                    max_interval=0,
-                    exponent=1,
-                    max_elapsed_time=0,
-                    jitter_ms=0,
+        try:
+            _mistral_client = Mistral(
+                api_key=api_key,
+                timeout_ms=get_provider_timeout_ms(),
+                retry_config=RetryConfig(
+                    strategy="none",
+                    backoff=BackoffStrategy(
+                        initial_interval=0,
+                        max_interval=0,
+                        exponent=1,
+                        max_elapsed_time=0,
+                        jitter_ms=0,
+                    ),
+                    retry_connection_errors=False,
                 ),
-                retry_connection_errors=False,
-            ),
+            )
+        except Exception as error:
+            log_event(
+                logger,
+                logging.ERROR,
+                "[MISTRAL]",
+                "Provider initialization failed",
+                error_type=type(error).__name__,
+                error_category="MISTRAL_INITIALIZATION_FAILED",
+            )
+            raise
+        log_event(
+            logger,
+            logging.INFO,
+            "[MISTRAL]",
+            "Provider initialization succeeded",
         )
     return _mistral_client
 
@@ -107,15 +140,46 @@ def _get_mistral_client() -> Mistral:
 def _get_gemini_client() -> genai.Client:
     global _gemini_client
     if _gemini_client is None:
+        log_event(
+            logger,
+            logging.INFO,
+            "[GEMINI]",
+            "Provider initialization started",
+        )
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
+            log_event(
+                logger,
+                logging.ERROR,
+                "[GEMINI]",
+                "Provider initialization failed",
+                error_type="RuntimeError",
+                error_category="GEMINI_NOT_CONFIGURED",
+            )
             raise RuntimeError("Gemini is not configured.")
-        _gemini_client = genai.Client(
-            api_key=api_key,
-            http_options=types.HttpOptions(
-                timeout=get_provider_timeout_ms(),
-                retry_options=types.HttpRetryOptions(attempts=1),
-            ),
+        try:
+            _gemini_client = genai.Client(
+                api_key=api_key,
+                http_options=types.HttpOptions(
+                    timeout=get_provider_timeout_ms(),
+                    retry_options=types.HttpRetryOptions(attempts=1),
+                ),
+            )
+        except Exception as error:
+            log_event(
+                logger,
+                logging.ERROR,
+                "[GEMINI]",
+                "Provider initialization failed",
+                error_type=type(error).__name__,
+                error_category="GEMINI_INITIALIZATION_FAILED",
+            )
+            raise
+        log_event(
+            logger,
+            logging.INFO,
+            "[GEMINI]",
+            "Provider initialization succeeded",
         )
     return _gemini_client
 
@@ -207,18 +271,37 @@ async def process_document_with_mistral(
     file_bytes: bytes,
     mime_type: str,
 ) -> DocumentExtractionResult:
+    started_at = time.perf_counter()
+    log_event(
+        logger,
+        logging.INFO,
+        "[MISTRAL]",
+        "Request started",
+    )
     try:
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             _process_with_mistral_sync,
             file_bytes,
             mime_type,
         )
     except Exception as error:
-        logger.warning(
-            "Mistral document processing failed; error_type=%s",
-            type(error).__name__,
+        log_exception(
+            logger,
+            "[MISTRAL]",
+            "Request failed",
+            error,
+            error_category="MISTRAL_REQUEST_FAILED",
+            duration_ms=round((time.perf_counter() - started_at) * 1000),
         )
         raise RuntimeError("Mistral document processing failed.") from None
+    log_event(
+        logger,
+        logging.INFO,
+        "[MISTRAL]",
+        "Request completed successfully",
+        duration_ms=round((time.perf_counter() - started_at) * 1000),
+    )
+    return result
 
 
 def _process_with_gemini_sync(
@@ -249,18 +332,37 @@ async def process_document_with_gemini(
     file_bytes: bytes,
     mime_type: str,
 ) -> DocumentExtractionResult:
+    started_at = time.perf_counter()
+    log_event(
+        logger,
+        logging.INFO,
+        "[GEMINI]",
+        "Request started",
+    )
     try:
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             _process_with_gemini_sync,
             file_bytes,
             mime_type,
         )
     except Exception as error:
-        logger.warning(
-            "Gemini document processing failed; error_type=%s",
-            type(error).__name__,
+        log_exception(
+            logger,
+            "[GEMINI]",
+            "Request failed",
+            error,
+            error_category="GEMINI_REQUEST_FAILED",
+            duration_ms=round((time.perf_counter() - started_at) * 1000),
         )
         raise RuntimeError("Gemini document processing failed.") from None
+    log_event(
+        logger,
+        logging.INFO,
+        "[GEMINI]",
+        "Request completed successfully",
+        duration_ms=round((time.perf_counter() - started_at) * 1000),
+    )
+    return result
 
 
 async def process_document(
@@ -272,17 +374,32 @@ async def process_document(
         result = await process_document_with_mistral(file_bytes, mime_type)
         return result, "MISTRAL"
     except Exception as error:
-        logger.info(
-            "Using Gemini fallback after Mistral failure; error_type=%s",
-            type(error).__name__,
+        log_event(
+            logger,
+            logging.WARNING,
+            "[GEMINI]",
+            "Fallback reason",
+            fallback_reason="MISTRAL_REQUEST_FAILED",
+            error_type=type(error).__name__,
+        )
+        log_event(
+            logger,
+            logging.INFO,
+            "[GEMINI]",
+            "Fallback started",
+            fallback_reason="MISTRAL_REQUEST_FAILED",
         )
 
     try:
         result = await process_document_with_gemini(file_bytes, mime_type)
         return result, "GEMINI_FALLBACK"
     except Exception as error:
-        logger.error(
-            "All AI providers failed; fallback_error_type=%s",
-            type(error).__name__,
+        log_event(
+            logger,
+            logging.ERROR,
+            "[VERIFICATION]",
+            "All AI providers failed",
+            error_type=type(error).__name__,
+            error_category="ALL_PROVIDERS_FAILED",
         )
         raise RuntimeError("AI providers failed to process the document.") from None

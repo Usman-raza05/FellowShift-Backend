@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from io import BytesIO
@@ -10,16 +11,19 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 import main
+from verification_api import providers
 from verification_api.schemas import DocumentExtractionResult
 
 
 class VerificationApiTests(unittest.TestCase):
+    SERVICE_TOKEN = "test-token-with-at-least-32-characters"
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.environment = patch.dict(
             os.environ,
             {
-                "FELLOWSHIFT_SERVICE_TOKEN": "test-token-with-at-least-32-characters",
+                "FELLOWSHIFT_SERVICE_TOKEN": self.SERVICE_TOKEN,
                 "IDEMPOTENCY_DB_PATH": os.path.join(self.temp_dir.name, "idempotency.sqlite3"),
                 "AI_REQUEST_TIMEOUT_SECONDS": "1",
             },
@@ -82,6 +86,9 @@ class VerificationApiTests(unittest.TestCase):
         headers = {"Idempotency-Key": key or f"request-key-{self.request_number}"}
         if authorization:
             headers["Authorization"] = "Bearer test-token-with-at-least-32-characters"
+
+        if authorization:
+            headers["Authorization"] = f"Bearer {self.SERVICE_TOKEN}"
 
         data = {
             "application_data": json.dumps(
@@ -251,7 +258,10 @@ class VerificationApiTests(unittest.TestCase):
             )
 
         main.app.state.document_processor = slow_processor
-        with patch.dict(os.environ, {"AI_REQUEST_TIMEOUT_SECONDS": "0.01"}):
+        with (
+            patch.dict(os.environ, {"AI_REQUEST_TIMEOUT_SECONDS": "0.01"}),
+            self.assertLogs(level="INFO") as captured,
+        ):
             response = self.post(
                 required_document_types=["income_certificate"],
                 document_types=["income_certificate"],
@@ -261,6 +271,9 @@ class VerificationApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["outcome"], "FAILED")
         self.assertEqual(response.json()["reasons"][0]["code"], "AI_PROVIDER_TIMEOUT")
+        messages = "\n".join(captured.output)
+        self.assertIn("error_category=AI_PROVIDER_TIMEOUT", messages)
+        self.assertIn("http_status=503", messages)
 
     def test_provider_fallback_is_reported(self) -> None:
         extracted = DocumentExtractionResult(
@@ -268,6 +281,7 @@ class VerificationApiTests(unittest.TestCase):
             document_type="income_certificate",
         )
         with (
+            self.assertLogs(providers.logger, level="INFO") as captured,
             patch(
                 "verification_api.providers.process_document_with_mistral",
                 new=AsyncMock(side_effect=RuntimeError("provider detail stays private")),
@@ -283,6 +297,251 @@ class VerificationApiTests(unittest.TestCase):
 
         self.assertEqual(result, extracted)
         self.assertEqual(provider, "GEMINI_FALLBACK")
+        messages = "\n".join(captured.output)
+        self.assertIn("Fallback reason", messages)
+        self.assertIn("Fallback started", messages)
+        self.assertIn("fallback_reason=MISTRAL_REQUEST_FAILED", messages)
+        self.assertNotIn("provider detail stays private", messages)
+
+    def test_mistral_success_and_failure_have_distinct_logs(self) -> None:
+        extracted = DocumentExtractionResult(is_valid_document=True)
+        with (
+            patch(
+                "verification_api.providers._process_with_mistral_sync",
+                return_value=extracted,
+            ),
+            self.assertLogs(providers.logger, level="INFO") as success_logs,
+        ):
+            result = asyncio.run(
+                providers.process_document_with_mistral(
+                    b"synthetic-image",
+                    "image/jpeg",
+                )
+            )
+        self.assertEqual(result, extracted)
+        self.assertIn(
+            "Request completed successfully",
+            "\n".join(success_logs.output),
+        )
+
+        with (
+            patch(
+                "verification_api.providers._process_with_mistral_sync",
+                side_effect=TimeoutError("provider secret detail"),
+            ),
+            self.assertLogs(providers.logger, level="INFO") as failure_logs,
+        ):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(
+                    providers.process_document_with_mistral(
+                        b"synthetic-image",
+                        "image/jpeg",
+                    )
+                )
+        failure_messages = "\n".join(failure_logs.output)
+        self.assertIn("Request failed", failure_messages)
+        self.assertIn("error_type=TimeoutError", failure_messages)
+        self.assertIn("error_category=MISTRAL_REQUEST_FAILED", failure_messages)
+        self.assertNotIn("provider secret detail", failure_messages)
+
+    def test_gemini_success_and_failure_are_logged_without_response_data(self) -> None:
+        extracted = DocumentExtractionResult(is_valid_document=True)
+        with (
+            patch(
+                "verification_api.providers._process_with_gemini_sync",
+                return_value=extracted,
+            ),
+            self.assertLogs(providers.logger, level="INFO") as success_logs,
+        ):
+            result = asyncio.run(
+                providers.process_document_with_gemini(
+                    b"synthetic-image",
+                    "image/jpeg",
+                )
+            )
+        self.assertEqual(result, extracted)
+        self.assertIn(
+            "Request completed successfully",
+            "\n".join(success_logs.output),
+        )
+
+        with (
+            patch(
+                "verification_api.providers._process_with_gemini_sync",
+                side_effect=ValueError("private OCR response"),
+            ),
+            self.assertLogs(providers.logger, level="INFO") as failure_logs,
+        ):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(
+                    providers.process_document_with_gemini(
+                        b"synthetic-image",
+                        "image/jpeg",
+                    )
+                )
+        failure_messages = "\n".join(failure_logs.output)
+        self.assertIn("Request failed", failure_messages)
+        self.assertIn("error_category=GEMINI_REQUEST_FAILED", failure_messages)
+        self.assertNotIn("private OCR response", failure_messages)
+
+    def test_both_provider_failure_is_distinguishable(self) -> None:
+        with (
+            patch(
+                "verification_api.providers.process_document_with_mistral",
+                new=AsyncMock(side_effect=RuntimeError("mistral private detail")),
+            ),
+            patch(
+                "verification_api.providers.process_document_with_gemini",
+                new=AsyncMock(side_effect=TimeoutError("gemini private detail")),
+            ),
+            self.assertLogs(providers.logger, level="INFO") as captured,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "AI providers failed"):
+                asyncio.run(
+                    providers.process_document(
+                        b"synthetic-image",
+                        "image/jpeg",
+                        "unused-document-type",
+                    )
+                )
+        messages = "\n".join(captured.output)
+        self.assertIn("All AI providers failed", messages)
+        self.assertIn("error_category=ALL_PROVIDERS_FAILED", messages)
+        self.assertNotIn("private detail", messages)
+
+    def test_request_lifecycle_logs_share_safe_correlation_id(self) -> None:
+        with self.assertLogs(level="INFO") as captured:
+            response = self.post(
+                application_data={
+                    "annual_income": 100,
+                    "student_name": "Private Synthetic Name",
+                },
+                required_document_types=["income_certificate"],
+                document_types=["income_certificate"],
+                file_content=self.synthetic_png(),
+                filename="private-document-name.png",
+                key="private-idempotency-key-001",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        messages = "\n".join(captured.output)
+        self.assertIn("[VERIFICATION]", messages)
+        self.assertIn("Request received", messages)
+        self.assertIn("[AUTH]", messages)
+        self.assertIn("Authentication succeeded", messages)
+        self.assertIn("[IDEMPOTENCY]", messages)
+        self.assertIn("Idempotency check succeeded", messages)
+        self.assertIn("[DOCUMENTS]", messages)
+        self.assertIn("Document validation completed", messages)
+        self.assertIn("[ELIGIBILITY]", messages)
+        self.assertIn("Evaluation completed", messages)
+        self.assertIn("Request completed", messages)
+        request_ids = {
+            entry.split("request_id=", 1)[1].split(" ", 1)[0]
+            for entry in captured.output
+            if "request_id=" in entry
+        }
+        self.assertEqual(len(request_ids), 1)
+        for sensitive_value in (
+            "Private Synthetic Name",
+            "private-document-name.png",
+            "private-idempotency-key-001",
+            self.SERVICE_TOKEN,
+            "application_data",
+        ):
+            self.assertNotIn(sensitive_value, messages)
+
+    def test_correlation_id_differs_between_requests(self) -> None:
+        request_ids = []
+        for index in range(2):
+            with self.assertLogs(level="INFO") as captured:
+                response = self.post(key=f"correlation-key-{index:02d}")
+            self.assertEqual(response.status_code, 200)
+            ids = {
+                entry.split("request_id=", 1)[1].split(" ", 1)[0]
+                for entry in captured.output
+                if "request_id=" in entry
+            }
+            self.assertEqual(len(ids), 1)
+            request_ids.extend(ids)
+        self.assertNotEqual(request_ids[0], request_ids[1])
+
+    def test_each_non_provider_503_path_logs_its_category(self) -> None:
+        cases = (
+            (
+                "auth",
+                {"FELLOWSHIFT_SERVICE_TOKEN": ""},
+                "AUTH_NOT_CONFIGURED",
+            ),
+            (
+                "idempotency",
+                {},
+                "IDEMPOTENCY_UNAVAILABLE",
+            ),
+            (
+                "processor",
+                {},
+                "PROCESSOR_NOT_CONFIGURED",
+            ),
+            (
+                "timeout_config",
+                {"AI_REQUEST_TIMEOUT_SECONDS": "0"},
+                "INVALID_TIMEOUT_CONFIGURATION",
+            ),
+        )
+        for case_name, environment, category in cases:
+            with self.subTest(case_name=case_name):
+                previous_processor = main.app.state.document_processor
+                if case_name == "processor":
+                    main.app.state.document_processor = None
+                idempotency_patch = None
+                with patch.dict(os.environ, environment):
+                    if case_name == "idempotency":
+                        idempotency_patch = patch(
+                            "verification_api.routes.claim_idempotency_key",
+                            side_effect=sqlite3.OperationalError(
+                                "private database detail"
+                            ),
+                        )
+                        idempotency_patch.start()
+                    try:
+                        with self.assertLogs(level="INFO") as captured:
+                            response = self.post(
+                                required_document_types=["income_certificate"],
+                                document_types=["income_certificate"],
+                                file_content=self.synthetic_png(),
+                            )
+                    finally:
+                        if idempotency_patch is not None:
+                            idempotency_patch.stop()
+                        main.app.state.document_processor = previous_processor
+
+                self.assertEqual(response.status_code, 503)
+                self.assertIn(
+                    f"error_category={category}",
+                    "\n".join(captured.output),
+                )
+
+    def test_unexpected_processor_exception_logs_safe_traceback_and_503(self) -> None:
+        async def failing_processor(*_args: object):
+            _ = _args
+            private_detail = "private OCR text and provider detail"
+            raise RuntimeError(private_detail)
+
+        main.app.state.document_processor = failing_processor
+        with self.assertLogs(level="INFO") as captured:
+            response = self.post(
+                required_document_types=["income_certificate"],
+                document_types=["income_certificate"],
+                file_content=self.synthetic_png(),
+            )
+
+        messages = "\n".join(captured.output)
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("Traceback (most recent call last)", messages)
+        self.assertIn("RuntimeError: sanitized exception", messages)
+        self.assertIn("error_category=AI_PROVIDER_FAILURE", messages)
+        self.assertNotIn("private OCR text", messages)
 
     def test_unauthorized_request_is_rejected(self) -> None:
         response = self.post(authorization=False)
