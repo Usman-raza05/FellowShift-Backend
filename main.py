@@ -4,6 +4,7 @@ import asyncio
 import sqlite3
 from typing import Optional
 from uuid import uuid4
+import logging
 
 from fastapi import (
     Depends,
@@ -33,6 +34,8 @@ from verification_api.schemas import (
 from verification_api.service import compare_document_data, evaluate_criteria
 from verification_api.idempotency import claim_idempotency_key
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("FellowShift")
 
 # ==============================================================================
 # APP SETUP
@@ -70,6 +73,7 @@ async def handle_request_validation_error(
 
 @app.get("/")
 def read_root():
+    logger.info("🚀 FellowShift API Root URL was called!")
     ready = (
         len(os.getenv("FELLOWSHIFT_SERVICE_TOKEN", "")) >= 32
         and bool(os.getenv("MISTRAL_API_KEY") or os.getenv("GEMINI_API_KEY"))
