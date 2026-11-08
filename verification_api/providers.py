@@ -36,7 +36,7 @@ _mistral_client: Mistral | None = None
 DOCUMENT_EXTRACTION_PROMPT = """
 You are a document OCR and structured data extraction assistant for scholarship applications.
 
-Analyze the uploaded document image and return accurate structured JSON matching the provided schema.
+Analyze the uploaded document image and return accurate structured JSON using exactly the keys and value types shown below.
 
 Instructions:
 
@@ -46,13 +46,37 @@ Instructions:
    * MARKSHEET
    * UNKNOWN
 
-2. Extract only information that is actually visible in the document:
+2. Carefully inspect the entire image and extract every clearly readable value that is actually visible. Do not return null for a visible, readable value. The exact output keys are:
    * Student's full name
    * Caste/category/community
    * Annual family income in INR
    * Academic percentage
    * Certificate or registration number
    * Issuing authority, if explicitly shown
+   * `is_valid_document` (boolean)
+   * `document_type` (one of the types listed above)
+   * `extracted_full_name` (string or null)
+   * `extracted_category_caste` (string or null)
+   * `extracted_annual_income` (number or null)
+   * `extracted_percentage` (number or null)
+   * `certificate_number` (string or null)
+   * `issuing_authority` (string or null)
+   * `discrepancies_or_issues` (array of strings)
+
+For example, when a readable income certificate visibly shows a student's name and income, return those values rather than null:
+{
+  "is_valid_document": true,
+  "document_type": "INCOME_CERT",
+  "extracted_full_name": "Aarav Sample",
+  "extracted_category_caste": null,
+  "extracted_annual_income": 120000,
+  "extracted_percentage": null,
+  "certificate_number": null,
+  "issuing_authority": null,
+  "discrepancies_or_issues": []
+}
+
+Represent annual income as a numeric INR amount without currency symbols or grouping commas (for example, `INR 120,000` becomes `120000`).
 
 3. Set `is_valid_document` to true when the image is readable and its content is recognizable as the expected document category. Do not mark a readable document invalid solely because it is a prototype, test fixture, or digitally generated example.
 
@@ -64,7 +88,7 @@ Instructions:
 
 7. A test/demo disclaimer is contextual information, not evidence of unreadability or fraud. If authenticity is required, report only that authenticity has not been verified.
 
-8. Never fabricate extracted values. Return null for fields that are not present.
+8. Never fabricate extracted values, certificate details, or issuing authorities. Return null for a field only when its value is genuinely absent from the image or unreadable.
 
 9. Return only valid JSON matching the supplied schema. Do not include Markdown fences or additional commentary.
 """
